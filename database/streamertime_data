@@ -1,0 +1,147 @@
+const { MongoClient, ChangeStream } = require('mongodb');
+const WebSocket = require('ws');
+const { Readable } = require('stream');
+const { pipeline: streamPipeline } = require('stream/promises');
+const { Transform } = require('stream');
+const zlib = require('zlib');
+const { promisify } = require('util');
+const deflate = promisify(zlib.deflate);
+
+// Streamer Configuration
+const STREAM_CONFIG = {
+  mongoUri: process.env.MONGO_URI || 'mongodb://localhost:27017/zero0x_db',
+  wsPort: parseInt(process.env.WS_PORT || 3000),
+  compressionLevel: 6,
+  datasets: ['trades_dataset', 'logs_dataset'],
+  maxBackpressure: 1024 * 1024 // 1MB
+};
+
+// Real-Time Data Streamer with Compression and Backpressure
+class RealTimeDataStreamer {
+  constructor() {
+    this.client = new MongoClient(STREAM_CONFIG.mongoUri);
+    this.db = null;
+    this.wss = new WebSocket.Server({ port: STREAM_CONFIG.wsPort, maxPayload: 10 * 1024 * 1024 });
+    this.changeStreams = new Map();
+    this.connected = false;
+  }
+
+  // Initialize with change stream setup
+  async initialize() {
+    await this.client.connect();
+    this.db = this.client.db();
+    this.connected = true;
+
+    this.wss.on('connection', ws => {
+      ws.on('message', msg => this.handleClientMessage(ws, msg));
+      ws.on('close', () => this.handleClientClose(ws));
+    });
+
+    for (const dataset of STREAM_CONFIG.datasets) {
+      this.setupChangeStream(dataset);
+    }
+  }
+
+  // Setup MongoDB change stream with full document lookup
+  setupChangeStream(dataset) {
+    const coll = this.db.collection(dataset);
+    const changeStream = coll.watch([], { fullDocument: 'updateLookup' });
+    changeStream.on('change', change => this.processChange(change, dataset));
+    changeStream.on('error', err => console.error(`Change Stream Error for ${dataset}:`, err));
+    this.changeStreams.set(dataset, changeStream);
+  }
+
+  // Process change with compression and streaming
+  async processChange(change, dataset) {
+    const fullDoc = change.fullDocument;
+    if (!fullDoc) return;
+
+    const compressed = await deflate(JSON.stringify(fullDoc), { level: STREAM_CONFIG.compressionLevel });
+    const readable = Readable.from([compressed]);
+
+    const transform = new Transform({
+      objectMode: true,
+      transform(chunk, encoding, callback) {
+        this.push({ dataset, event: 'change', data: chunk.toString('base64') });
+        callback();
+      }
+    });
+
+    try {
+      await streamPipeline(readable, transform, this.broadcastStream());
+    } catch (err) {
+      console.error('Stream Pipeline Error:', err);
+    }
+  }
+
+  // Broadcast stream with backpressure handling
+  broadcastStream() {
+    return new Transform({
+      objectMode: true,
+      highWaterMark: STREAM_CONFIG.maxBackpressure,
+      transform(broadcastData, encoding, callback) {
+        this.wss.clients.forEach(client => {
+          if (client.readyState === WebSocket.OPEN && !client._paused) {
+            client.send(JSON.stringify(broadcastData), err => {
+              if (err) client._paused = true; // Pause on error
+            });
+          }
+        });
+        callback();
+      }
+    });
+  }
+
+  // Handle client messages for subscriptions
+  handleClientMessage(ws, msg) {
+    try {
+      const { action, dataset } = JSON.parse(msg);
+      if (action === 'subscribe' && STREAM_CONFIG.datasets.includes(dataset)) {
+        ws.subscriptions = ws.subscriptions || new Set();
+        ws.subscriptions.add(dataset);
+      } else if (action === 'unsubscribe') {
+        ws.subscriptions.delete(dataset);
+      }
+    } catch (err) {
+      ws.send(JSON.stringify({ error: 'Invalid message' }));
+    }
+  }
+
+  // Handle client close and cleanup
+  handleClientClose(ws) {
+    if (ws.subscriptions) ws.subscriptions.clear();
+  }
+
+  // Shutdown streams and server
+  async shutdown() {
+    this.changeStreams.forEach(stream => stream.close());
+    this.wss.close();
+    await this.client.close();
+    this.connected = false;
+  }
+}
+
+module.exports = RealTimeDataStreamer;
+
+// Example usage with streaming complexity
+if (require.main === module) {
+  (async () => {
+    const streamer = new RealTimeDataStreamer();
+    try {
+      await streamer.initialize();
+      console.log(`WebSocket server running on port ${STREAM_CONFIG.wsPort}`);
+      // Simulate changes by inserting test data
+      setInterval(async () => {
+        await streamer.db.collection('trades_dataset').insertOne({
+          chain: 'solana',
+          type: 'trade',
+          amount: Math.random() * 100,
+          '_time': new Date()
+        });
+      }, 2000);
+    } catch (err) {
+      console.error('Streamer Error:', err);
+    }
+    // No shutdown in example to keep running
+  })();
+}
