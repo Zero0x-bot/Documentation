@@ -1,0 +1,148 @@
+const { MongoClient } = require('mongodb');
+const fs = require('fs/promises');
+const path = require('path');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const execAsync = promisify(exec);
+const { S3 } = require('@aws-sdk/client-s3');
+const tar = require('tar');
+
+// Backup Orchestrator Configuration
+const BACKUP_CONFIG = {
+  mongoUri: process.env.MONGO_URI || 'mongodb://localhost:27017/zero0x_db',
+  backupDir: path.join(__dirname, 'backups'),
+  s3Bucket: process.env.S3_BUCKET || 'zero0x-backups',
+  datasets: ['trades_dataset', 'analytics_dataset', 'logs_dataset'],
+  encryptionPass: process.env.BACKUP_PASS || 'secret',
+  maxVersions: 5
+};
+
+// AWS S3 Client
+const s3 = new S3({ region: process.env.AWS_REGION || 'us-east-1' });
+
+// BackupRestoreOrchestrator Class with Tar Compression and S3 Sync
+class BackupRestoreOrchestrator {
+  constructor() {
+    this.client = new MongoClient(BACKUP_CONFIG.mongoUri);
+    this.db = null;
+    this.connected = false;
+  }
+
+  // Initialize connection
+  async initialize() {
+    await this.client.connect();
+    this.db = this.client.db();
+    this.connected = true;
+    await fs.mkdir(BACKUP_CONFIG.backupDir, { recursive: true });
+  }
+
+  // Perform full backup with mongodump, tar, and encryption
+  async performBackup() {
+    if (!this.connected) await this.initialize();
+
+    const timestamp = new Date().toISOString().replace(/:/g, '-');
+    const dumpDir = path.join(BACKUP_CONFIG.backupDir, `dump_${timestamp}`);
+    const tarFile = `${dumpDir}.tar.gz`;
+    const encryptedFile = `${tarFile}.enc`;
+
+    try {
+      // Mongodump
+      await execAsync(`mongodump --uri "${BACKUP_CONFIG.mongoUri}" --out "${dumpDir}" --gzip`);
+
+      // Tar the dump
+      await tar.c({
+        gzip: true,
+        file: tarFile,
+        cwd: BACKUP_CONFIG.backupDir
+      }, [`dump_${timestamp}`]);
+
+      // Encrypt tar
+      await execAsync(`openssl enc -aes-256-cbc -salt -in "${tarFile}" -out "${encryptedFile}" -pass pass:${BACKUP_CONFIG.encryptionPass}`);
+
+      // Upload to S3
+      const body = await fs.readFile(encryptedFile);
+      await s3.putObject({
+        Bucket: BACKUP_CONFIG.s3Bucket,
+        Key: path.basename(encryptedFile),
+        Body: body,
+        Metadata: { timestamp }
+      });
+
+      // Cleanup local files
+      await this.cleanupLocalBackups(timestamp);
+
+      return { backupKey: path.basename(encryptedFile) };
+    } catch (err) {
+      throw new Error(`Backup failed: ${err.message}`);
+    }
+  }
+
+  // Cleanup old backups exceeding max versions
+  async cleanupLocalBackups(currentTimestamp) {
+    const files = await fs.readdir(BACKUP_CONFIG.backupDir);
+    const backups = files.filter(f => f.endsWith('.enc')).sort().slice(0, -BACKUP_CONFIG.maxVersions);
+    for (const file of backups) {
+      await fs.unlink(path.join(BACKUP_CONFIG.backupDir, file));
+    }
+  }
+
+  // Restore from S3 with decryption and mongorestore
+  async restoreBackup(backupKey) {
+    if (!this.connected) await this.initialize();
+
+    const localFile = path.join(BACKUP_CONFIG.backupDir, backupKey);
+    const decryptedTar = localFile.replace('.enc', '');
+    const extractDir = decryptedTar.replace('.tar.gz', '');
+
+    try {
+      // Download from S3
+      const { Body } = await s3.getObject({ Bucket: BACKUP_CONFIG.s3Bucket, Key: backupKey });
+      await fs.writeFile(localFile, Body);
+
+      // Decrypt
+      await execAsync(`openssl enc -d -aes-256-cbc -in "${localFile}" -out "${decryptedTar}" -pass pass:${BACKUP_CONFIG.encryptionPass}`);
+
+      // Extract tar
+      await tar.x({ file: decryptedTar, cwd: BACKUP_CONFIG.backupDir });
+
+      // Mongorestore
+      await execAsync(`mongorestore --uri "${BACKUP_CONFIG.mongoUri}" --dir "${extractDir}" --gzip`);
+
+      // Cleanup
+      await fs.rm(localFile);
+      await fs.rm(decryptedTar);
+      await fs.rm(extractDir, { recursive: true });
+
+      return { status: 'restored' };
+    } catch (err) {
+      throw new Error(`Restore failed: ${err.message}`);
+    }
+  }
+
+  // Shutdown
+  async shutdown() {
+    await this.client.close();
+    this.connected = false;
+  }
+}
+
+module.exports = BackupRestoreOrchestrator;
+
+// Example usage with backup and restore
+if (require.main === module) {
+  (async () => {
+    const orchestrator = new BackupRestoreOrchestrator();
+    try {
+      await orchestrator.initialize();
+      const { backupKey } = await orchestrator.performBackup();
+      console.log('Backup Completed:', backupKey);
+
+      // Simulate restore
+      // await orchestrator.restoreBackup(backupKey);
+    } catch (err) {
+      console.error('Orchestrator Error:', err);
+    } finally {
+      await orchestrator.shutdown();
+    }
+  })();
+}
