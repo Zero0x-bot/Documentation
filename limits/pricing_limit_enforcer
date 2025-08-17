@@ -1,0 +1,134 @@
+const { MongoClient } = require('mongodb');
+const RateLimiter = require('limiter').RateLimiter;
+const EventEmitter = require('events');
+const { performance } = require('perf_hooks');
+
+// Pricing Limit Configuration
+const PRICING_CONFIG = {
+  mongoUri: process.env.MONGO_URI || 'mongodb://localhost:27017/zero0x_db',
+  maxMonthlyCost: 1000, // USD per org
+  costPerGB: 0.1, // USD per GB ingested
+  tempLimitTTL: 24 * 60 * 60 * 1000, // 1 day in ms
+  alertThreshold: 0.8 // 80% of limit
+};
+
+// Pricing Events Emitter
+class PricingEvents extends EventEmitter {}
+const pricingEvents = new PricingEvents();
+
+// PricingLimitEnforcer Class
+class PricingLimitEnforcer {
+  constructor() {
+    this.client = new MongoClient(PRICING_CONFIG.mongoUri);
+    this.db = null;
+    this.connected = false;
+    this.rateLimiter = new RateLimiter({ tokensPerInterval: 20, interval: 'second' });
+    this.costCache = new Map(); // orgID -> {currentCost, tempLimitExpiry}
+  }
+
+  // Initialize connection and indexes
+  async initialize() {
+    await this.client.connect();
+    this.db = this.client.db();
+    this.connected = true;
+
+    const coll = this.db.collection('pricing_limits');
+    await coll.createIndex({ org_id: 1 }, { unique: true });
+    await coll.createIndex({ temp_limit_expiry: 1 }, { expireAfterSeconds: 0 });
+
+    pricingEvents.emit('enforcer:initialized');
+  }
+
+  // Enforce pricing limit on ingestion
+  async enforceIngestion(orgID, ingestionSizeGB) {
+    if (!this.connected) await this.initialize();
+    await this.rateLimiter.removeTokens(1);
+
+    const start = performance.now();
+    const coll = this.db.collection('pricing_limits');
+
+    let doc = await coll.findOne({ org_id: orgID });
+    if (!doc) {
+      doc = { org_id: orgID, current_cost: 0 };
+      await coll.insertOne(doc);
+    }
+
+    const costAddition = ingestionSizeGB * PRICING_CONFIG.costPerGB;
+    const newCost = doc.current_cost + costAddition;
+
+    if (newCost > PRICING_CONFIG.maxMonthlyCost) {
+      pricingEvents.emit('limit:exceeded', { orgID, newCost });
+      throw new Error(`Monthly cost limit exceeded for org ${orgID}`);
+    }
+
+    if (doc.temp_limit_expiry && new Date(doc.temp_limit_expiry) > new Date() && newCost > doc.temp_limit) {
+      pricingEvents.emit('temp_limit:exceeded', { orgID, newCost });
+      throw new Error(`Temporary cost limit exceeded for org ${orgID}`);
+    }
+
+    await coll.updateOne({ org_id: orgID }, { $set: { current_cost: newCost } });
+    const duration = performance.now() - start;
+
+    pricingEvents.emit('ingestion:enforced', { orgID, costAddition, duration });
+
+    if (newCost / PRICING_CONFIG.maxMonthlyCost > PRICING_CONFIG.alertThreshold) {
+      pricingEvents.emit('alert:threshold', { orgID, usage: newCost / PRICING_CONFIG.maxMonthlyCost });
+    }
+
+    return { newCost };
+  }
+
+  // Set temporary account-specific limit
+  async setTempLimit(orgID, tempLimit, expiryDate) {
+    if (!this.connected) await this.initialize();
+
+    const coll = this.db.collection('pricing_limits');
+    await coll.updateOne(
+      { org_id: orgID },
+      { $set: { temp_limit, temp_limit_expiry: expiryDate } },
+      { upsert: true }
+    );
+
+    pricingEvents.emit('temp_limit:set', { orgID, tempLimit, expiry: expiryDate });
+  }
+
+  // Reset monthly cost (e.g., at billing cycle)
+  async resetMonthlyCost(orgID) {
+    if (!this.connected) await this.initialize();
+
+    const coll = this.db.collection('pricing_limits');
+    await coll.updateOne({ org_id: orgID }, { $set: { current_cost: 0 } });
+
+    pricingEvents.emit('cost:reset', { orgID });
+  }
+
+  // Shutdown
+  async shutdown() {
+    await this.client.close();
+    this.connected = false;
+    pricingEvents.emit('enforcer:shutdown');
+  }
+}
+
+module.exports = PricingLimitEnforcer;
+
+// Example usage with events
+if (require.main === module) {
+  (async () => {
+    const enforcer = new PricingLimitEnforcer();
+    pricingEvents.on('limit:exceeded', data => console.error('Limit Exceeded:', data));
+    pricingEvents.on('alert:threshold', data => console.warn('Alert Threshold:', data));
+
+    try {
+      await enforcer.initialize();
+      await enforcer.setTempLimit('org123', 500, new Date(Date.now() + PRICING_CONFIG.tempLimitTTL));
+      const { newCost } = await enforcer.enforceIngestion('org123', 1000); // Would exceed if temp limit active
+      console.log('New Cost:', newCost);
+      await enforcer.resetMonthlyCost('org123');
+    } catch (err) {
+      console.error('Enforcer Error:', err);
+    } finally {
+      await enforcer.shutdown();
+    }
+  })();
+}
