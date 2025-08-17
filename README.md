@@ -1,27 +1,27 @@
 # Documentation
 
 Zero0x Trading Platform
-Zero0x is a high-performance observability platform for Solana and Ethereum trading analytics, leveraging Axiom's event-driven architecture for scalable ingestion, storage, and querying of trade traces and metrics. This README provides an overview of features, setup instructions, and API usage for developers.
+Zero0x is a high-performance observability platform for Solana and Ethereum trading analytics, built on Axiom's event-driven architecture for scalable ingestion, storage, and querying of trade traces and metrics.
 Features
 
 Axiom Cloud Deployment: Fully managed infrastructure for seamless operation.
 EventDB:
 Ingest: Coordination-free pipeline with linear scaling, no Kafka required.
-Storage: Custom block-based format with 25×-50× compression on object storage (S3).
-Query: Serverless ephemeral runtimes using Axiom Processing Language (APL) for filtering, aggregations, and virtual fields.
+Storage: Custom block-based format with 25×-50× compression on S3.
+Query: Serverless runtimes using Axiom Processing Language (APL) for filtering, aggregations, and virtual fields.
 
 
 Console:
-Query Builders: Simple and advanced interfaces for APL-based queries.
+Query Builders: Simple and advanced APL-based interfaces.
 Visualizations: Charts, graphs, and trace waterfalls for trade analysis.
-Dashboards: Combine charts, log streams, and annotations for real-time insights.
+Dashboards: Combine charts, log streams, and annotations.
 Monitors: Threshold, match, and anomaly monitors for trade alerts.
 Alerting: Webhooks, Slack, email, and custom integrations.
 
 
 Governance:
 Role-Based Access Control (RBAC) at dataset/organization levels.
-Audit logs for tracking user actions.
+Audit logs for user action tracking.
 Dataset management with retention and field vacuuming.
 
 
@@ -39,24 +39,24 @@ Terraform provider for resource management.
 Security & Compliance: SOC 2 Type II, GDPR, CCPA, HIPAA compliant.
 
 Architecture
-Zero0x uses Axiom's distributed architecture for cost-efficient, scalable observability:
+Zero0x leverages Axiom’s distributed architecture for cost-efficient observability:
 
-Ingestion: Regional edge proxies handle JSON/CSV data, with write-ahead logging for durability.
-Storage: Columnar format with dictionary, bitmap, and numeric compression, stored in S3.
+Ingestion: Regional edge proxies handle JSON/CSV data with write-ahead logging.
+Storage: Columnar format with dictionary, bitmap, and numeric compression.
 Query: Serverless workers execute APL queries with block-level parallelism and caching.
-Compaction: Background optimization merges blocks for better compression and query speed.
-Microservices: Stateless core services, database layer, and edge services ensure fault tolerance.
+Compaction: Background optimization for better compression and query speed.
+Microservices: Stateless core, database, and edge services ensure fault tolerance.
 
 Setup Instructions
 Prerequisites
 
-MongoDB (libmongoc-dev, libjson-c-dev for C files)
+MongoDB (libmongoc-dev, libjson-c-dev)
 PowerShell 7+ (Windows/Linux/macOS)
-Git, GCC, and dependencies
+Git, GCC
 
 Installation
 
-Clone the Repository:
+Clone Repository:
 git clone https://github.com/your-org/zero0x.git
 cd zero0x
 
@@ -91,20 +91,22 @@ Start-Process -FilePath ".\query_usage_doc.exe" -ArgumentList "org123" -Redirect
 
 
 Generate System Requirements Documentation:
-.\system_requirements_doc.exe; if ($LASTEXITCODE -eq 0) { Get-Content system_requirements_doc.json | ConvertFrom-Json | Format-Table }
+.\system_requirements_doc.exe
+Get-Content system_requirements_doc.json | ConvertFrom-Json | Format-Table
 
 
 Dispatch Trace to Region:
 $trace = '{"attributes":{"trade_id":"123","trade_type":"arbitrage"}}'
-.\region_trace_dispatcher.exe US $trace > dispatcher_output.txt
+.\region_trace_dispatcher.exe US $trace | Out-File dispatcher_output.txt
 
 
 Validate Trace Requirements:
 $trace = '{"attributes":{"trade_id":"123","level":"info","trade_type":"arbitrage"},"_time":1697059200000}'
-.\requirement_validator.exe $trace; if ($LASTEXITCODE -ne 0) { Write-Error "Validation failed" }
+.\requirement_validator.exe $trace
+if ($LASTEXITCODE -ne 0) { Write-Error "Validation failed" }
 
 
-Run All Documentation Generators in Parallel:
+Run Documentation Generators in Parallel:
 $jobs = @(
     Start-Job -ScriptBlock { .\trace_schema_doc.exe },
     Start-Job -ScriptBlock { .\query_usage_doc.exe org123 },
@@ -121,8 +123,8 @@ REST API
 Base URL: https://api.zero0x.trade/v1 (US), https://api.eu.zero0x.trade/v1 (EU)
 Authentication: Use API tokens or Personal Access Tokens.
 Endpoints:
-POST /ingest: Send trade traces (JSON/CSV).$headers = @{ "Authorization" = "Bearer $env:API_TOKEN" }
-$body = '{"attributes":{"trade_id":"123","level":"info"},"_time":"2025-08-17T10:31:00Z"}'
+POST /ingest: Send trade traces.$headers = @{ "Authorization" = "Bearer $env:API_TOKEN" }
+$body = '{"attributes":{"trade_id":"123","level":"info"},"_time":"2025-08-17T22:33:00Z"}'
 Invoke-RestMethod -Uri "https://api.zero0x.trade/v1/ingest" -Method Post -Headers $headers -Body $body -ContentType "application/json"
 
 
@@ -149,12 +151,11 @@ Run Query:axiom-cli query run --query "['trades_dataset'] | where chain_id=='sol
 Development
 
 Add New Feature:
-git checkout -b feature/new-trace-endpoint
-# Edit files, e.g., trace_schema_doc.c
-git add .; git commit -m "Add new trace endpoint"; git push origin feature/new-trace-endpoint
+git checkout -b feature/new-endpoint
+git add .; git commit -m "Add new endpoint"; git push origin feature/new-endpoint
 
 
-Run Tests with MongoDB:
+Run Tests:
 $env:TEST_MONGO_URI = "mongodb://localhost:27017/test"
 gcc -o test_suite test_suite.c -lmongoc-1.0 -lbson-1.0 -ljson-c
 .\test_suite.exe | Tee-Object -FilePath test_results.log
@@ -163,9 +164,9 @@ gcc -o test_suite test_suite.c -lmongoc-1.0 -lbson-1.0 -ljson-c
 
 Contributing
 
-Fork the repository and submit pull requests.
-Follow code style: 4-space indentation, descriptive variable names.
-Test changes with MongoDB locally before submitting.
+Fork and submit pull requests.
+Use 4-space indentation and descriptive variable names.
+Test locally with MongoDB before submitting.
 
 License
 MIT License. See LICENSE for details.
